@@ -176,10 +176,8 @@ def validate_unique_names(data: dict) -> list[str]:
 
     model_name = model.get("name", "<unnamed>")
 
-    # Names are collected with an explicit "is not None" guard rather than a
-    # truthiness check: the schema accepts an empty string as a name (no
-    # minLength), and "" is a genuine value that must not silently escape
-    # duplicate detection. Only a missing name (None) is skipped here.
+    # Guard on "is not None", not truthiness: "" is a schema-valid name (no
+    # minLength) and must not slip past duplicate detection.
 
     # Check unique dataset names
     dataset_names = [d.get("name") for d in model.get("datasets", []) if d.get("name") is not None]
@@ -216,9 +214,8 @@ def validate_references(data: dict) -> list[str]:
     errors = []
 
     model_name = model.get("name", "<unnamed>")
-    # An empty or missing dataset name cannot be a valid join target, so
-    # datasets keyed by a falsy name are intentionally excluded here: a
-    # relationship pointing at "" should be reported as unknown, not matched.
+    # Exclude falsy dataset names so a relationship pointing at "" is reported
+    # as unknown rather than matched.
     datasets = {d.get("name"): d for d in model.get("datasets", []) if d.get("name")}
 
     for rel in model.get("relationships", []):
@@ -226,9 +223,8 @@ def validate_references(data: dict) -> list[str]:
         from_ds = rel.get("from")
         to_ds = rel.get("to")
 
-        # "is not None" rather than truthiness: from/to are schema-required
-        # strings with no minLength, so "" reaches here as a declared-but-invalid
-        # reference that must be reported instead of silently skipped.
+        # "is not None", not truthiness: "" is a declared-but-invalid reference
+        # that must be reported, not skipped.
         if from_ds is not None and from_ds not in datasets:
             errors.append(f"[Reference] Relationship '{rel_name}' in model '{model_name}' references unknown dataset '{from_ds}'")
         if to_ds is not None and to_ds not in datasets:
@@ -303,15 +299,9 @@ def validate_sql_expression(expr: str, dialect: str, context: str) -> str | None
         # Try parsing as expression first (for field expressions like "column_name")
         sqlglot.parse_one(expr, dialect=sqlglot_dialect)
         return None
-    except (ParseError, TokenError):
-        # A bare column reference fails to parse on its own; retry it wrapped in
-        # a SELECT below before deciding it is invalid.
-        pass
-    except Exception:  # noqa: BLE001
-        # sqlglot can fail in ways beyond ParseError/TokenError — notably a
-        # RecursionError on pathologically nested input. Fall through to the
-        # SELECT-wrapped attempt, which reports a diagnostic rather than letting
-        # the exception escape and abort the whole validation run.
+    except Exception:
+        # Any failure (a parse error, or a RecursionError on deeply nested
+        # input) falls through to the SELECT-wrapped retry below.
         pass
 
     try:
@@ -321,10 +311,9 @@ def validate_sql_expression(expr: str, dialect: str, context: str) -> str | None
     except (ParseError, TokenError) as e:
         return f"[SQL] {context}: {str(e).split(chr(10))[0]}"
     except RecursionError:
-        # Deeply nested SQL (e.g. thousands of parentheses) exhausts the
-        # recursion limit instead of raising a parser error; report it.
+        # Deeply nested input exhausts the recursion limit, not a parser error.
         return f"[SQL] {context}: expression is too deeply nested to parse"
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         return f"[SQL] {context}: {str(e).split(chr(10))[0] or type(e).__name__}"
 
 
@@ -410,9 +399,7 @@ def main():
             print(f"Error: Invalid YAML: {e}")
             sys.exit(1)
         except RecursionError:
-            # Deeply nested flow collections exhaust the recursion limit while
-            # PyYAML composes the node graph; it surfaces as RecursionError, not
-            # YAMLError, so catch it here to exit cleanly instead of crashing.
+            # Deeply nested input surfaces as RecursionError, not YAMLError.
             print("Error: Invalid YAML: input is too deeply nested to parse")
             sys.exit(1)
 
