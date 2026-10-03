@@ -20,113 +20,166 @@
 Issue #469: a hand-edited TML document can carry a value of the wrong Python
 type (a list where a string is expected, an int for an expression, and so on).
 PR #482 covered the column and model `name` cases; these cover the remaining
-TML->Ossie scalar reads it enumerated as untouched — `aggregation`, a formula
-`expr`, a physical `data_type`, a `db_column_name`, and a join `on` — each of
-which used to escape as a bare TypeError/AttributeError, breaking the
-converter's "never a bare traceback" contract. Each now logs a TS-* WARNING and
-degrades, matching the surrounding degrade-and-continue pattern.
+TML->Ossie scalar reads it enumerated as untouched -- `aggregation`, a formula
+`expr`, a physical `data_type`, a `db_column_name`, and a join `on`.
+
+The guards for the values that also flow into the model-scope stash (`expr` and
+`db_column_name`) live at the point the data is built, not at one reader, so
+the whole `to-ossie` -> `to-tml` round trip stays free of bare tracebacks
+rather than just the field/metric readers. These tests therefore drive full
+documents through `convert()` (and `ossie_to_thoughtspot.convert()` for the
+stashed values) and assert on the issue log and the emitted document, not only
+on the single-helper return value.
 """
 
+from ossie_thoughtspot import ossie_to_thoughtspot
 from ossie_thoughtspot.issues import IssueLog
-from ossie_thoughtspot.tml_to_ossie import (
-    _physical_db_column_name,
-    _relationship_from_join,
-    convert_field,
-    convert_metric,
-)
+from ossie_thoughtspot.tml import DocumentSet, TmlDocument
+from ossie_thoughtspot.tml_to_ossie import _relationship_from_join, convert
 
 
-def _resolve(table, column):
-    return None if table == "MISSING" else f"{table.lower()}.{column.lower()}"
+# -- builders (mirroring tests/test_tml_to_ossie.py) --------------------------
+
+def _table(name, columns):
+    return TmlDocument(
+        kind="table",
+        body={"name": name, "db": "SALES", "schema": "PUBLIC", "db_table": name,
+              "connection": {"name": "My Snowflake"}, "columns": columns},
+        guid=None,
+    )
 
 
-def _lookup(data_type="DOUBLE", db_column_name="AMOUNT"):
-    """A table_lookup returning one physical column, ORDERS::AMOUNT."""
-    column = {"name": "AMOUNT", "db_column_name": db_column_name,
-              "db_column_properties": {"data_type": data_type}}
-    table = {"ORDERS": {"name": "ORDERS", "columns": [column]}}
-    return table.get
+def _column(name, db_column_name, data_type="VARCHAR"):
+    return {"name": name, "db_column_name": db_column_name,
+            "db_column_properties": {"data_type": data_type}}
 
 
-def _codes(log):
-    return {issue["code"] for issue in log.as_dicts()}
+def _model(columns, formulas=None):
+    body = {"name": "Sales Analytics", "model_tables": [{"name": "ORDERS"}],
+            "columns": columns}
+    if formulas is not None:
+        body["formulas"] = formulas
+    return TmlDocument(kind="model", body=body, guid=None)
 
 
-def test_non_string_aggregation_falls_back_to_none_and_is_reported():
-    # `aggregation` as a list would make the `not in _AGGREGATION` membership
-    # test raise on an unhashable value; it is treated as NONE and reported.
-    log = IssueLog()
-    metric = convert_metric(
-        {"name": "Total Amount", "column_id": "ORDERS::AMOUNT",
+def _document_set(model_doc, table_doc):
+    return DocumentSet(model=model_doc, tables=(table_doc,))
+
+
+def _codes(issues):
+    return {issue["code"] for issue in issues}
+
+
+def _no_traceback_to_tml(ossie_document):
+    """to-tml must not raise on the converted document (the stash is the part a
+    user is least likely to hand-edit correctly)."""
+    result = ossie_to_thoughtspot.convert(ossie_document)
+    assert result is not None
+    return result
+
+
+# -- aggregation --------------------------------------------------------------
+
+def test_non_string_aggregation_falls_back_to_none():
+    # A list aggregation would crash the `not in _AGGREGATION` membership test on
+    # an unhashable value; it is reported and the metric emits as NONE (a bare
+    # column reference, no aggregate wrapper), not dropped.
+    orders = _table("ORDERS", [_column("Amount", "O_TOTALPRICE", "DOUBLE")])
+    model = _model(columns=[
+        {"name": "Total", "column_id": "ORDERS::Amount",
          "properties": {"column_type": "MEASURE", "aggregation": ["SUM"]}},
-        {}, _lookup(), _resolve, log,
+    ])
+
+    result = convert(_document_set(model, orders))
+
+    assert "TS-METRIC-AGGREGATION-UNKNOWN" in _codes(result.issues.as_dicts())
+    metric = result.model["metrics"][0]
+    thoughtspot = next(d["expression"] for d in metric["expression"]["dialects"]
+                       if d["dialect"] == "THOUGHTSPOT")
+    assert thoughtspot == "[ORDERS::Amount]"  # NONE: no sum(...)/avg(...) wrapper
+
+
+# -- formula expr (reaches convert_field/metric AND the stash) ----------------
+
+def test_non_string_formula_expr_is_reported_and_not_stashed():
+    orders = _table("ORDERS", [_column("Amount", "O_TOTALPRICE", "DOUBLE")])
+    model = _model(
+        columns=[{"name": "Bad", "formula_id": "f1",
+                  "properties": {"column_type": "MEASURE", "aggregation": "SUM"}}],
+        formulas=[{"id": "f1", "name": "Bad", "expr": 42}],
     )
 
-    assert metric is not None
-    assert "TS-METRIC-AGGREGATION-UNKNOWN" in _codes(log)
+    result = convert(_document_set(model, orders))
+
+    assert "TS-FORMULA-EXPR-INVALID" in _codes(result.issues.as_dicts())
+    assert result.model.get("metrics", []) == []  # the bad formula built no metric
+    # The invalid expr must not have reached the model-scope stash, or to-tml
+    # would raise a bare TypeError on it.
+    _no_traceback_to_tml(result.model)
 
 
-def test_non_string_metric_formula_expr_is_reported_and_skipped():
-    log = IssueLog()
-    metric = convert_metric(
-        {"name": "Bad Metric", "formula_id": "f1",
-         "properties": {"column_type": "MEASURE", "aggregation": "SUM"}},
-        {"f1": {"id": "f1", "expr": 42}}, _lookup(), _resolve, log,
+def test_unsurfaced_non_string_formula_expr_is_reported_and_not_stashed():
+    # A formula no column references is normally preserved verbatim in the
+    # unsurfaced-formulas stash; a non-string expr must be dropped there too.
+    orders = _table("ORDERS", [_column("Amount", "O_TOTALPRICE", "DOUBLE")])
+    model = _model(
+        columns=[{"name": "Amount", "column_id": "ORDERS::Amount",
+                  "properties": {"column_type": "ATTRIBUTE"}}],
+        formulas=[{"id": "orphan", "name": "Orphan", "expr": ["not", "a", "string"]}],
     )
 
-    assert metric is None
-    assert "TS-METRIC-FORMULA-INVALID" in _codes(log)
+    result = convert(_document_set(model, orders))
+
+    assert "TS-FORMULA-EXPR-INVALID" in _codes(result.issues.as_dicts())
+    _no_traceback_to_tml(result.model)
 
 
-def test_non_string_field_formula_expr_is_reported_and_skipped():
-    log = IssueLog()
-    field = convert_field(
-        {"name": "Bad Field", "formula_id": "f1",
+# -- db_column_name (reaches the resolver, the field stash, and the helper) ---
+
+def test_non_string_db_column_name_emits_no_warehouse_reference():
+    orders = _table("ORDERS", [_column("Amount", 42, "DOUBLE")])
+    model = _model(columns=[
+        {"name": "Amount", "column_id": "ORDERS::Amount",
          "properties": {"column_type": "ATTRIBUTE"}},
-        {"f1": {"id": "f1", "expr": 42}}, _lookup(), _resolve, log,
-    )
+    ])
 
-    assert field is None
-    assert "TS-FIELD-FORMULA-INVALID" in _codes(log)
+    result = convert(_document_set(model, orders))
+
+    assert "TS-COLUMN-DB-NAME-INVALID" in _codes(result.issues.as_dicts())
+    field = result.model["datasets"][0]["fields"][0]
+    # No `ORDERS.42` leaked into an ANSI_SQL sibling; the invalid name is absent.
+    for dialect in field.get("expression", {}).get("dialects", []):
+        assert "42" not in dialect["expression"]
+    _no_traceback_to_tml(result.model)
 
 
-def test_non_string_data_type_emits_no_datatype_and_is_reported():
-    # `data_type` as a list has no Ossie equivalent and would crash
-    # datatypes.to_ossie on an unhashable value; the field is still built.
+# -- join `on` ----------------------------------------------------------------
+
+def _run_join(on_expression):
     log = IssueLog()
-    field = convert_field(
-        {"name": "Amount", "column_id": "ORDERS::AMOUNT",
-         "properties": {"column_type": "ATTRIBUTE"}},
-        {}, _lookup(data_type=["DOUBLE"]), _resolve, log,
+    result = _relationship_from_join(
+        name="orders_to_customers", from_prefix="ORDERS", to_prefix="CUSTOMERS",
+        on_expression=on_expression, join_type=None, cardinality=None,
+        join_shape="inline", referencing_join=None,
+        table_lookup=lambda name: None, log=log,
     )
-
-    assert field is not None
-    assert "datatype" not in field
-    assert "TS-FIELD-DATATYPE-UNMAPPED" in _codes(log)
+    return result, log.as_dicts()
 
 
-def test_non_string_db_column_name_is_treated_as_absent():
-    # A non-string db_column_name is unusable as an identifier basis and would
-    # crash identifiers.normalise downstream; it reads as absent (None).
-    assert _physical_db_column_name("ORDERS", "AMOUNT", _lookup(db_column_name=42)) is None
-
-
-def test_non_string_join_condition_is_reported_as_malformed():
-    log = IssueLog()
-    relationship, unrepresentable, has_residual = _relationship_from_join(
-        name="orders_to_customers",
-        from_prefix="ORDERS",
-        to_prefix="CUSTOMERS",
-        on_expression=42,
-        join_type=None,
-        cardinality=None,
-        join_shape="inline",
-        referencing_join=None,
-        table_lookup=lambda name: None,
-        log=log,
-    )
+def test_truthy_non_string_join_condition_is_dropped_and_reported():
+    (relationship, unrepresentable, has_residual), issues = _run_join(42)
 
     assert relationship is None
-    assert unrepresentable is None
+    assert unrepresentable is None  # dropped, not preserved
     assert has_residual is False
-    assert "TS-JOIN-MALFORMED" in _codes(log)
+    assert "TS-JOIN-CONDITION-INVALID" in _codes(issues)
+
+
+def test_falsy_non_string_join_condition_keeps_its_no_condition_meaning():
+    # `on: []`, `on: 0`, etc. meant "no condition" before this change and must
+    # keep reporting TS-JOIN-NO-CONDITION, not the new invalid-condition code.
+    for falsy in ([], {}, 0, False):
+        (relationship, unrepresentable, _), issues = _run_join(falsy)
+        assert relationship is None and unrepresentable is None
+        assert "TS-JOIN-NO-CONDITION" in _codes(issues)
+        assert "TS-JOIN-CONDITION-INVALID" not in _codes(issues)

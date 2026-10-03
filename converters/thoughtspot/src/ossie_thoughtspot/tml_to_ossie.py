@@ -447,13 +447,7 @@ def _physical_db_column_name(
     )
     if physical is None:
         return None
-    db_column_name = physical.get("db_column_name")
-    # A non-string db_column_name (wrong type in a hand-edited document) is
-    # unusable as an identifier basis and would crash identifiers.normalise in
-    # the caller; treat it as absent, the same as a missing db_column_name.
-    if not isinstance(db_column_name, str):
-        return None
-    return db_column_name
+    return physical.get("db_column_name")
 
 
 def _resolve_name_collision(
@@ -707,18 +701,6 @@ def convert_field(
                 message=(
                     f"column {display_name!r} has formula_id {formula_id!r}, whose "
                     f"formulas[] entry has no expr; no field can be built"
-                ),
-                object_ref=object_ref,
-            )
-            return None
-        if not isinstance(formula_entry["expr"], str):
-            log.add(
-                code="TS-FIELD-FORMULA-INVALID",
-                severity=Severity.WARNING,
-                message=(
-                    f"column {display_name!r} has formula_id {formula_id!r}, whose "
-                    f"formulas[] entry has a non-string expr "
-                    f"{formula_entry['expr']!r}; no field can be built"
                 ),
                 object_ref=object_ref,
             )
@@ -1116,18 +1098,6 @@ def convert_metric(
                 object_ref=object_ref,
             )
             return None
-        if not isinstance(formula_entry["expr"], str):
-            log.add(
-                code="TS-METRIC-FORMULA-INVALID",
-                severity=Severity.WARNING,
-                message=(
-                    f"column {display_name!r} has formula_id {formula_id!r}, whose "
-                    f"formulas[] entry has a non-string expr "
-                    f"{formula_entry['expr']!r}; no metric can be built"
-                ),
-                object_ref=object_ref,
-            )
-            return None
         expr = formula_entry["expr"]
         metric_name = _field_or_metric_identifier(
             display_name, None, allocator, log, kind="metric", object_ref=object_ref,
@@ -1363,6 +1333,39 @@ def _normalized_physical_columns(body: dict, kind: str) -> list[dict]:
     `_normalize_physical_column` -- the shape `table_lookup` hands to
     `_physical_datatype`."""
     return [_normalize_physical_column(entry, kind) for entry in _raw_physical_columns(body, kind)]
+
+
+def _physical_columns_with_valid_db_names(
+    columns: list[dict], prefix: str, log: IssueLog
+) -> list[dict]:
+    """`columns` with any non-string `db_column_name` dropped to `None`.
+
+    Every consumer of a physical column -- the ANSI_SQL resolver, the field
+    stash, and `_physical_db_column_name` -- reads `db_column_name` from
+    `physical_columns_by_prefix`. A wrongly-typed value (an int, a list, or a
+    YAML-parsed date in a hand-edited document) left in place emits a nonsense
+    warehouse reference like `ORDERS.42`, or raises a bare error in to-tml's
+    json.dumps. Dropping it to `None` here, once, sends every consumer down its
+    existing "no warehouse name" path, and the loss is reported rather than
+    silently emitted.
+    """
+    sanitized = []
+    for column in columns:
+        db_column_name = column.get("db_column_name")
+        if db_column_name is not None and not isinstance(db_column_name, str):
+            log.add(
+                code="TS-COLUMN-DB-NAME-INVALID",
+                severity=Severity.WARNING,
+                message=(
+                    f"physical column {column.get('name')!r} on dataset {prefix!r} "
+                    f"has a non-string db_column_name {db_column_name!r}; it is "
+                    f"ignored and no warehouse column name is used for it"
+                ),
+                object_ref=f"dataset:{prefix}",
+            )
+            column = {**column, "db_column_name": None}
+        sanitized.append(column)
+    return sanitized
 
 
 #: The TML `db_column_properties.data_type` spelling `datatypes.to_tml` would
@@ -1863,7 +1866,8 @@ def _relationship_from_join(
     """One join -> `(relationship, unrepresentable_entry, has_residual_predicates)`.
 
     Exactly one of `relationship`/`unrepresentable_entry` is non-`None` (or
-    both `None` when there is no condition at all to report). Implements the
+    both `None` when there is no condition to report, or the condition is not a
+    representable string and the join is dropped). Implements the
     *Non-equality joins* table: at least one equality pair emits a
     `Relationship`, with any residual predicates riding along in its own
     `custom_extensions` rather than withholding the relationship; zero
@@ -1879,17 +1883,22 @@ def _relationship_from_join(
     apply to, so `from`/`to` there stay exactly TML's own, unswapped.
     """
     object_ref = f"relationship:{name}"
-    if on_expression is not None and not isinstance(on_expression, str):
-        # A non-string `on` (a list or int in a hand-edited document) would raise
-        # a bare AttributeError on the .strip() below; report it as a malformed
-        # condition instead, the same degrade-and-skip the parse failure gets.
+    if on_expression and not isinstance(on_expression, str):
+        # A truthy non-string `on` (a list or int in a hand-edited document)
+        # would raise a bare AttributeError on the .strip() below. It is not a
+        # representable condition, so the join is dropped -- not preserved in
+        # `unrepresentable_joins`, whose stash stores `on` verbatim and would
+        # then carry the non-string value on into to-tml. A distinct code, not
+        # TS-JOIN-MALFORMED, because that one preserves the join. A falsy
+        # non-string (`[]`, `{}`, `0`, `False`) keeps its prior "no condition"
+        # meaning and falls through to the check below.
         log.add(
-            code="TS-JOIN-MALFORMED",
+            code="TS-JOIN-CONDITION-INVALID",
             severity=Severity.WARNING,
             message=(
                 f"join {name!r} from {from_prefix!r} to {to_prefix!r} has a "
                 f"non-string condition {on_expression!r}; it cannot be represented "
-                f"as a relationship"
+                f"as a relationship and is dropped"
             ),
             object_ref=object_ref,
         )
@@ -2314,8 +2323,8 @@ def convert(document_set: DocumentSet) -> OssieConversion:
         dataset_bodies[prefix] = dataset_dict
         dataset_stashes[prefix] = ds_stash
         table_docs[prefix] = table_doc.body
-        physical_columns_by_prefix[prefix] = _normalized_physical_columns(
-            table_doc.body, table_doc.kind
+        physical_columns_by_prefix[prefix] = _physical_columns_with_valid_db_names(
+            _normalized_physical_columns(table_doc.body, table_doc.kind), prefix, log
         )
         fields_by_dataset[prefix] = []
 
@@ -2357,9 +2366,29 @@ def convert(document_set: DocumentSet) -> OssieConversion:
         return f"{table}.{warehouse_reference}"
 
     # -- Phase 3: fields and metrics ------------------------------------------
-    formulas: dict[str, dict] = {
-        f["id"]: f for f in (model_body.get("formulas") or []) if f.get("id")
-    }
+    # A non-string formula expr (an int, a list, or a YAML-parsed date in a
+    # hand-edited document) reaches every reader below -- convert_field,
+    # convert_metric, and both the unattributed and unsurfaced stash paths --
+    # and would raise a bare TypeError in to-ossie or in to-tml's json.dumps.
+    # Report it once here and drop the key, so each reader takes its existing
+    # "entry has no expr" path instead.
+    formulas: dict[str, dict] = {}
+    for f in model_body.get("formulas") or []:
+        formula_id = f.get("id")
+        if not formula_id:
+            continue
+        if "expr" in f and not isinstance(f["expr"], str):
+            log.add(
+                code="TS-FORMULA-EXPR-INVALID",
+                severity=Severity.WARNING,
+                message=(
+                    f"formula {formula_id!r} has a non-string expr {f['expr']!r}; "
+                    f"it is ignored and no expression is emitted or preserved for it"
+                ),
+                object_ref=f"formula:{formula_id}",
+            )
+            f = {k: v for k, v in f.items() if k != "expr"}
+        formulas[formula_id] = f
     metrics: list[dict] = []
     # Field identifiers are scoped per dataset in Ossie (Field.name is unique
     # "within the dataset"); metrics are scoped to the whole model (Metric.name
